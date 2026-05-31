@@ -1,6 +1,5 @@
 #!/bin/bash
 # ========== srv.lab.local ==========
-set -e
 
 hostnamectl set-hostname srv.lab.local
 IFACE=ens18
@@ -121,6 +120,10 @@ volumes:
 EOF
 docker compose up -d 2>/dev/null || docker-compose up -d
 
+# --- Удаление конфликтующего пакета (если есть) ---
+apt-get remove -y alterator-datetime 2>/dev/null || true
+# ------------------------------------------------
+
 apt-get install -y apache2 mariadb-server php8.4 php8.4-mysqlnd apache2-mod_ssl
 systemctl enable --now mariadb || systemctl enable --now mysqld
 systemctl restart mariadb || systemctl restart mysqld
@@ -154,7 +157,7 @@ sed -i 's/$password = "password";/$password = "P@ssw0rd";/' "$DOCROOT/index.php"
 sed -i 's/$dbname = "db";/$dbname = "webdb";/' "$DOCROOT/index.php" 2>/dev/null
 systemctl restart httpd2 || systemctl restart apache2
 
-# RAID5 (используем /dev/vdb, /dev/vdc, /dev/vdd)
+# RAID5 (vdb,vdc,vdd)
 if [ -b /dev/vdb ] && [ -b /dev/vdc ] && [ -b /dev/vdd ]; then
   apt-get install -y mdadm e2fsprogs
   mdadm --create /dev/md0 --level=5 --raid-devices=3 /dev/vdb /dev/vdc /dev/vdd --run
@@ -181,6 +184,7 @@ else
   echo "Secret admins only" > /srv/storage/secret/readme.txt
 fi
 
+# Ввод srv в домен (Samba шары)
 apt-get install -y samba samba-client krb5-workstation samba-winbind bind-utils
 cat > /etc/net/ifaces/$IFACE/resolv.conf <<EOF
 search lab.local
@@ -248,7 +252,7 @@ if [ -f /tmp/srv.lab.local.crt ] && [ -f /tmp/srv.lab.local.key ]; then
   mv /tmp/srv.lab.local.key /etc/pki/tls/private/
   mv /tmp/lab-root-ca.crt /etc/pki/tls/certs/
   chmod 600 /etc/pki/tls/private/srv.lab.local.key
-  a2enmod ssl proxy proxy_http
+  a2enmod ssl proxy proxy_http 2>/dev/null || true
   systemctl restart httpd2
   cat > /etc/httpd2/conf/sites-available/lab-https.conf <<'EOF'
 <VirtualHost *:80>
@@ -283,7 +287,7 @@ EOF
   grep -q 'Listen 443' /etc/httpd2/conf/httpd2.conf || echo "Listen 443" >> /etc/httpd2/conf/httpd2.conf
   systemctl restart httpd2
 else
-  echo "SSL certificates not found, HTTPS not configured"
+  echo "SSL certificates not found in /tmp/, HTTPS not configured"
 fi
 
 echo "=== srv done ==="
