@@ -104,7 +104,11 @@ systemctl restart sssd
 sss_cache -E
 
 realm list
-echo "P@ssw0rd" | kinit Administrator@LAB.LOCAL
+if ! realm list | grep -q "configured:.*kerberos-member"; then
+    echo "P@ssw0rd" | realm join -U Administrator lab.local
+else
+    echo "Already joined to domain, skipping realm join"
+fi
 klist
 id ivanov@lab.local
 
