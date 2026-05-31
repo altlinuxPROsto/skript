@@ -1,6 +1,5 @@
 #!/bin/bash
-# ========== srv.lab.local ==========
-set -e
+# ========== srv.lab.local (устойчивый, повторный запуск) ==========
 safe() { "$@" || true; }
 
 hostnamectl set-hostname srv.lab.local
@@ -157,18 +156,21 @@ sed -i 's/$password = "password";/$password = "P@ssw0rd";/' "$DOCROOT/index.php"
 sed -i 's/$dbname = "db";/$dbname = "webdb";/' "$DOCROOT/index.php" 2>/dev/null
 safe systemctl restart httpd2 || safe systemctl restart apache2
 
-# RAID5 (vdb,vdc,vdd)
+# ========== РАЗДЕЛ RAID (исправлен, безопасный повторный запуск) ==========
 if [ -b /dev/vdb ] && [ -b /dev/vdc ] && [ -b /dev/vdd ]; then
     apt-get install -y mdadm e2fsprogs
     if [ ! -b /dev/md0 ]; then
         mdadm --create /dev/md0 --level=5 --raid-devices=3 /dev/vdb /dev/vdc /dev/vdd --run
+        sleep 2
     fi
-    mkfs.ext4 -F /dev/md0 2>/dev/null || true
+    if ! blkid /dev/md0 | grep -q 'TYPE="ext4"'; then
+        mkfs.ext4 -F /dev/md0
+    fi
     mkdir -p /srv/storage
     UUID=$(blkid -s UUID -o value /dev/md0)
-    grep -q '/srv/storage' /etc/fstab || echo "UUID=$UUID /srv/storage ext4 defaults 0 2" >> /etc/fstab
-    mount -a
-    mdadm --detail --scan > /etc/mdadm.conf
+    sed -i '/\/srv\/storage/d' /etc/fstab
+    echo "UUID=$UUID /srv/storage ext4 defaults 0 2" >> /etc/fstab
+    mountpoint -q /srv/storage || mount /srv/storage
 else
     mkdir -p /srv/storage
 fi
@@ -179,6 +181,7 @@ chmod 0770 /srv/storage/secret
 echo "Readme instructions" > /srv/storage/instructions/readme.txt
 echo "Public share" > /srv/storage/share/readme.txt
 echo "Secret admins only" > /srv/storage/secret/readme.txt
+# ========== КОНЕЦ РАЗДЕЛА RAID ==========
 
 # Ввод srv в домен (Samba)
 apt-get install -y samba samba-client krb5-workstation samba-winbind bind-utils
