@@ -1,11 +1,10 @@
 #!/bin/bash
 # ========== cli.lab.local ==========
-set -e
 
 hostnamectl set-hostname cli.lab.local
 IFACE=ens18
 mkdir -p /etc/net/ifaces/$IFACE
-cat /etc/net/ifaces/ens18/options
+
 cat > /etc/net/ifaces/$IFACE/options <<EOF
 TYPE=eth
 BOOTPROTO=dhcp
@@ -30,7 +29,7 @@ systemctl restart network
 ip -br a
 
 apt-get update
-apt-get install -y sudo openssh-server htop procps sshpass
+apt-get install -y sudo openssh-server htop procps ansible openssh-clients bind-utils samba-client cifs-utils task-auth-ad-sssd krb5-workstation sshpass
 
 for u in admin monitor; do
   id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u"
@@ -70,24 +69,22 @@ EOF
 systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony
 systemctl restart chronyd 2>/dev/null || systemctl restart chrony
 
-apt-get install -y ansible openssh-clients bind-utils samba-client cifs-utils
 mkdir -p /etc/ansible
 cat > /etc/ansible/inventory.ini <<'EOF'
 [servers]
-isp ansible_host=172.16.0.1
-dc  ansible_host=172.16.0.10
-srv ansible_host=172.16.0.20
+isp ansible_host=172.16.0.1 ansible_port=2222
+dc  ansible_host=172.16.0.10 ansible_port=2222
+srv ansible_host=172.16.0.20 ansible_port=2222
 
 [servers:vars]
 ansible_user=admin
-ansible_port=2222
 ansible_become=true
 ansible_become_method=sudo
 ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_private_key_file=/home/admin/.ssh/id_ed25519
 EOF
 chown -R admin:admin /etc/ansible
 
-apt-get install -y task-auth-ad-sssd krb5-workstation
 cat > /etc/net/ifaces/$IFACE/resolv.conf <<EOF
 search lab.local
 nameserver 172.16.0.10
@@ -95,6 +92,7 @@ EOF
 systemctl restart network
 
 realm discover lab.local
+# Проверяем, не присоединены ли уже
 if ! realm list | grep -q "configured:.*kerberos-member"; then
     echo "P@ssw0rd" | realm join -U Administrator lab.local
 else
@@ -108,11 +106,7 @@ systemctl restart sssd
 sss_cache -E
 
 realm list
-if ! realm list | grep -q "configured:.*kerberos-member"; then
-    echo "P@ssw0rd" | realm join -U Administrator lab.local
-else
-    echo "Already joined to domain, skipping realm join"
-fi
+echo "P@ssw0rd" | kinit Administrator@LAB.LOCAL
 klist
 id ivanov@lab.local
 
@@ -126,7 +120,6 @@ chmod 600 /root/.smb-ivanov
 mount -t cifs //srv.lab.local/instructions /mnt/instructions -o credentials=/root/.smb-ivanov,vers=3.0
 mount -t cifs //srv.lab.local/share /mnt/share -o credentials=/root/.smb-ivanov,vers=3.0
 mount -t cifs //srv.lab.local/secret /mnt/secret -o credentials=/root/.smb-ivanov,vers=3.0
-df -h | grep mnt
 
 sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 admin@172.16.0.10:/root/ca/certs/lab-root-ca.crt /tmp/lab-root-ca.crt
 if [ -d /etc/pki/ca-trust/source/anchors ]; then
@@ -141,15 +134,13 @@ else
 fi
 openssl verify -CAfile /tmp/lab-root-ca.crt /tmp/lab-root-ca.crt
 
-# Настройка SSH ключей от admin
-su - admin <<'ADMIN_CMDS'
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
-sshpass -p 'P@ssw0rd' ssh-copy-id -o StrictHostKeyChecking=no -p 2222 admin@172.16.0.1
-sshpass -p 'P@ssw0rd' ssh-copy-id -o StrictHostKeyChecking=no -p 2222 admin@172.16.0.10
-sshpass -p 'P@ssw0rd' ssh-copy-id -o StrictHostKeyChecking=no -p 2222 admin@172.16.0.20
-cat > ~/.ssh/config <<'EOF'
+# Генерация и копирование SSH-ключей для admin
+su - admin <<'ADMIN_SCRIPT'
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q <<< y >/dev/null 2>&1
+for ip in 172.16.0.1 172.16.0.10 172.16.0.20; do
+  sshpass -p 'P@ssw0rd' ssh-copy-id -o StrictHostKeyChecking=no -p 2222 admin@$ip 2>/dev/null
+done
+cat > ~/.ssh/config <<EOF
 Host isp
   HostName 172.16.0.1
   User admin
@@ -170,7 +161,7 @@ chmod 600 ~/.ssh/config
 ssh isp hostname -f
 ssh dc hostname -f
 ssh srv hostname -f
-ADMIN_CMDS
+ADMIN_SCRIPT
 
 cat > /etc/ansible/install_htop.yml <<'EOF'
 ---
@@ -182,6 +173,7 @@ cat > /etc/ansible/install_htop.yml <<'EOF'
       command: apt-get install -y htop
       changed_when: false
 EOF
+
 ansible all -i /etc/ansible/inventory.ini -m ping
 ansible-playbook -i /etc/ansible/inventory.ini /etc/ansible/install_htop.yml
 
