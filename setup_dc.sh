@@ -1,6 +1,5 @@
 #!/bin/bash
 # ========== dc.lab.local ==========
-set -e
 
 hostnamectl set-hostname dc.lab.local
 IFACE=ens18
@@ -222,9 +221,13 @@ grep -q 'Listen 443' /etc/httpd2/conf/httpd2.conf || echo "Listen 443" >> /etc/h
 systemctl enable --now httpd2 || systemctl enable --now apache2
 systemctl restart httpd2 || systemctl restart apache2
 
-# Копирование сертификатов на srv
-sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 /root/ca/certs/srv.lab.local.crt admin@172.16.0.20:/tmp/
-sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 /root/ca/private/srv.lab.local.key admin@172.16.0.20:/tmp/
-sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 /root/ca/certs/lab-root-ca.crt admin@172.16.0.20:/tmp/
+# Копирование сертификатов на srv (ждём, пока srv поднимется, но если нет — пропускаем)
+if ping -c1 -W2 172.16.0.20 >/dev/null 2>&1; then
+    sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 /root/ca/certs/srv.lab.local.crt admin@172.16.0.20:/tmp/ 2>/dev/null || true
+    sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 /root/ca/private/srv.lab.local.key admin@172.16.0.20:/tmp/ 2>/dev/null || true
+    sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 /root/ca/certs/lab-root-ca.crt admin@172.16.0.20:/tmp/ 2>/dev/null || true
+else
+    echo "srv not reachable, copy certificates manually later"
+fi
 
 echo "=== dc done ==="
