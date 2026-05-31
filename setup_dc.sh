@@ -1,5 +1,7 @@
 #!/bin/bash
 # ========== dc.lab.local ==========
+set -e
+safe() { "$@" || true; }
 
 hostnamectl set-hostname dc.lab.local
 IFACE=ens18
@@ -12,12 +14,10 @@ ONBOOT=yes
 NM_CONTROLLED=no
 DISABLED=no
 EOF
-
 cat > /etc/net/ifaces/$IFACE/resolv.conf <<EOF
 search lab.local
 nameserver 8.8.8.8
 EOF
-
 cat > /etc/hosts <<EOF
 127.0.0.1 localhost
 172.16.0.1 isp.lab.local isp
@@ -26,78 +26,83 @@ cat > /etc/hosts <<EOF
 EOF
 
 systemctl restart network
-ip -br a
-
 apt-get update
 apt-get install -y task-samba-dc samba-client bind-utils krb5-workstation sshpass
 
-systemctl disable --now bind named krb5kdc nmb smb slapd 2>/dev/null || true
-systemctl disable --now samba 2>/dev/null || true
+safe systemctl disable --now bind named krb5kdc nmb smb slapd
+safe systemctl disable --now samba
 rm -f /etc/samba/smb.conf
 rm -rf /var/lib/samba /var/cache/samba
 mkdir -p /var/lib/samba/sysvol
 
-samba-tool domain provision \
-  --use-rfc2307 \
-  --realm=LAB.LOCAL \
-  --domain=LAB \
-  --server-role=dc \
-  --dns-backend=SAMBA_INTERNAL \
-  --adminpass='P@ssw0rd' \
-  --option='dns forwarder = 8.8.8.8'
-
-cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf
+# Проверяем, не настроен ли уже домен, чтобы не делать provision повторно
+if [ ! -f /var/lib/samba/private/sam.ldb ]; then
+    samba-tool domain provision \
+        --use-rfc2307 \
+        --realm=LAB.LOCAL \
+        --domain=LAB \
+        --server-role=dc \
+        --dns-backend=SAMBA_INTERNAL \
+        --adminpass='P@ssw0rd' \
+        --option='dns forwarder = 8.8.8.8'
+    cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf
+fi
 
 cat > /etc/net/ifaces/$IFACE/resolv.conf <<EOF
 search lab.local
 nameserver 127.0.0.1
 EOF
-
 systemctl restart network
 systemctl enable --now samba
+safe systemctl restart samba
 
-samba-tool domain info 127.0.0.1
-host -t SRV _kerberos._udp.lab.local.
-host -t SRV _ldap._tcp.lab.local.
-echo "P@ssw0rd" | kinit Administrator@LAB.LOCAL
-klist
+# Проверка
+safe samba-tool domain info 127.0.0.1
+safe host -t SRV _kerberos._udp.lab.local.
+safe host -t SRV _ldap._tcp.lab.local.
+echo "P@ssw0rd" | safe kinit Administrator@LAB.LOCAL
+safe klist
 
-# OU и пользователи
-samba-tool ou create "OU=admins,DC=lab,DC=local"
-samba-tool ou create "OU=others,DC=lab,DC=local"
-samba-tool ou create "OU=managers,DC=lab,DC=local"
-samba-tool group add admins
-samba-tool group add managers
-samba-tool user create ivanov 'P@ssw0rd' --userou='OU=admins'
-samba-tool user create petrov 'P@ssw0rd' --userou='OU=managers'
-samba-tool user create sidorov 'P@ssw0rd' --userou='OU=managers'
-samba-tool user setexpiry ivanov --noexpiry
-samba-tool user setexpiry petrov --noexpiry
-samba-tool user setexpiry sidorov --noexpiry
-samba-tool group addmembers admins ivanov
-samba-tool group addmembers managers petrov,sidorov
+# OU, группы, пользователи (игнорируем already exists)
+for ou in admins managers others; do
+    safe samba-tool ou create "OU=$ou,DC=lab,DC=local"
+done
+for group in admins managers; do
+    safe samba-tool group add $group
+done
+for user in ivanov petrov sidorov; do
+    case $user in
+        ivanov) ou=admins; group=admins ;;
+        *) ou=managers; group=managers ;;
+    esac
+    safe samba-tool user create $user 'P@ssw0rd' --userou="OU=$ou"
+    safe samba-tool user setexpiry $user --noexpiry
+    safe samba-tool group addmembers $group $user
+done
 
-# DNS записи
-samba-tool dns add 127.0.0.1 lab.local dc A 172.16.0.10 -U 'Administrator%P@ssw0rd' || true
-samba-tool dns add 127.0.0.1 lab.local srv A 172.16.0.20 -U 'Administrator%P@ssw0rd' || true
-samba-tool dns add 127.0.0.1 lab.local moodle CNAME dc.lab.local. -U 'Administrator%P@ssw0rd'
-samba-tool dns add 127.0.0.1 lab.local web CNAME srv.lab.local. -U 'Administrator%P@ssw0rd'
-samba-tool dns add 127.0.0.1 lab.local docker CNAME srv.lab.local. -U 'Administrator%P@ssw0rd'
-samba-tool dns zonecreate 127.0.0.1 0.16.172.in-addr.arpa -U 'Administrator%P@ssw0rd' || true
-samba-tool dns add 127.0.0.1 0.16.172.in-addr.arpa 10 PTR dc.lab.local. -U 'Administrator%P@ssw0rd' || true
-samba-tool dns add 127.0.0.1 0.16.172.in-addr.arpa 20 PTR srv.lab.local. -U 'Administrator%P@ssw0rd' || true
-samba-tool dns add 127.0.0.1 0.16.172.in-addr.arpa 1 PTR isp.lab.local. -U 'Administrator%P@ssw0rd' || true
+# DNS записи (игнорируем ошибки)
+safe samba-tool dns add 127.0.0.1 lab.local dc A 172.16.0.10 -U 'Administrator%P@ssw0rd'
+safe samba-tool dns add 127.0.0.1 lab.local srv A 172.16.0.20 -U 'Administrator%P@ssw0rd'
+safe samba-tool dns add 127.0.0.1 lab.local moodle CNAME dc.lab.local. -U 'Administrator%P@ssw0rd'
+safe samba-tool dns add 127.0.0.1 lab.local web CNAME srv.lab.local. -U 'Administrator%P@ssw0rd'
+safe samba-tool dns add 127.0.0.1 lab.local docker CNAME srv.lab.local. -U 'Administrator%P@ssw0rd'
+safe samba-tool dns zonecreate 127.0.0.1 0.16.172.in-addr.arpa -U 'Administrator%P@ssw0rd'
+safe samba-tool dns add 127.0.0.1 0.16.172.in-addr.arpa 10 PTR dc.lab.local. -U 'Administrator%P@ssw0rd'
+safe samba-tool dns add 127.0.0.1 0.16.172.in-addr.arpa 20 PTR srv.lab.local. -U 'Administrator%P@ssw0rd'
+safe samba-tool dns add 127.0.0.1 0.16.172.in-addr.arpa 1 PTR isp.lab.local. -U 'Administrator%P@ssw0rd'
 
-# GPO
-samba-tool gpo create "LAB Base Policy" -U 'Administrator%P@ssw0rd'
+# GPO (игнорируем, если уже существует)
+safe samba-tool gpo create "LAB Base Policy" -U 'Administrator%P@ssw0rd'
 GPO_GUID=$(samba-tool gpo listall -U 'Administrator%P@ssw0rd' | grep -i "LAB Base Policy" | awk '{print $3}')
-samba-tool gpo setlink "DC=lab,DC=local" "$GPO_GUID" -U 'Administrator%P@ssw0rd'
+if [ -n "$GPO_GUID" ]; then
+    safe samba-tool gpo setlink "DC=lab,DC=local" "$GPO_GUID" -U 'Administrator%P@ssw0rd'
+fi
 
-# Пользователи и sudo на dc
+# Локальные пользователи и sudo (уже должны быть, но добавим)
 apt-get install -y sudo openssh-server htop procps
 for u in admin monitor; do
-  id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u"
-  echo "$u:P@ssw0rd" | chpasswd
+    id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u"
+    echo "$u:P@ssw0rd" | chpasswd
 done
 cat > /etc/sudoers.d/lab-users <<'EOF'
 admin ALL=(ALL) NOPASSWD: ALL
@@ -105,6 +110,7 @@ Cmnd_Alias MONITORING = /usr/bin/htop, /bin/htop, /usr/bin/df, /bin/df, /usr/bin
 monitor ALL=(root) NOPASSWD: MONITORING
 EOF
 chmod 0440 /etc/sudoers.d/lab-users
+
 echo "Authorized access only" > /etc/issue.net
 SSHD_CONFIG=/etc/openssh/sshd_config
 [ -f /etc/ssh/sshd_config ] && SSHD_CONFIG=/etc/ssh/sshd_config
@@ -117,9 +123,9 @@ MaxAuthTries 2
 PermitRootLogin no
 AllowUsers admin monitor
 EOF
-sshd -t -f "$SSHD_CONFIG"
+safe sshd -t -f "$SSHD_CONFIG"
 systemctl enable --now sshd
-systemctl restart sshd
+safe systemctl restart sshd
 
 # NTP клиент
 apt-get install -y chrony
@@ -130,17 +136,20 @@ rtcsync
 logdir /var/log/chrony
 EOF
 systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony
-systemctl restart chronyd 2>/dev/null || systemctl restart chrony
+safe systemctl restart chronyd 2>/dev/null || safe systemctl restart chrony
 
-# CA и HTTPS для moodle, сертификат для srv
+# CA и HTTPS для moodle, а также сертификат для srv
 apt-get install -y openssl apache2 apache2-mod_ssl
-a2enmod ssl rewrite 2>/dev/null || true
+safe a2enmod ssl rewrite
 mkdir -p /root/ca/{certs,csr,newcerts,private}
 chmod 700 /root/ca/private
 touch /root/ca/index.txt
 echo 1000 > /root/ca/serial
-openssl genrsa -out /root/ca/private/lab-root-ca.key 4096
-openssl req -x509 -new -nodes -key /root/ca/private/lab-root-ca.key -sha256 -days 365 -out /root/ca/certs/lab-root-ca.crt -subj "/C=RU/ST=LAB/L=LAB/O=LAB.LOCAL/OU=IT/CN=LAB.LOCAL Root CA"
+
+if [ ! -f /root/ca/certs/lab-root-ca.crt ]; then
+    openssl genrsa -out /root/ca/private/lab-root-ca.key 4096
+    openssl req -x509 -new -nodes -key /root/ca/private/lab-root-ca.key -sha256 -days 365 -out /root/ca/certs/lab-root-ca.crt -subj "/C=RU/ST=LAB/L=LAB/O=LAB.LOCAL/OU=IT/CN=LAB.LOCAL Root CA"
+fi
 
 # Сертификат для dc
 cat > /root/ca/dc-san.cnf <<'EOF'
@@ -164,8 +173,10 @@ DNS.1 = dc.lab.local
 DNS.2 = moodle.lab.local
 IP.1 = 172.16.0.10
 EOF
-openssl req -new -nodes -out /root/ca/csr/dc.lab.local.csr -newkey rsa:2048 -keyout /root/ca/private/dc.lab.local.key -config /root/ca/dc-san.cnf
-openssl x509 -req -in /root/ca/csr/dc.lab.local.csr -CA /root/ca/certs/lab-root-ca.crt -CAkey /root/ca/private/lab-root-ca.key -CAcreateserial -out /root/ca/certs/dc.lab.local.crt -days 365 -sha256 -extensions req_ext -extfile /root/ca/dc-san.cnf
+if [ ! -f /root/ca/certs/dc.lab.local.crt ]; then
+    openssl req -new -nodes -out /root/ca/csr/dc.lab.local.csr -newkey rsa:2048 -keyout /root/ca/private/dc.lab.local.key -config /root/ca/dc-san.cnf
+    openssl x509 -req -in /root/ca/csr/dc.lab.local.csr -CA /root/ca/certs/lab-root-ca.crt -CAkey /root/ca/private/lab-root-ca.key -CAcreateserial -out /root/ca/certs/dc.lab.local.crt -days 365 -sha256 -extensions req_ext -extfile /root/ca/dc-san.cnf
+fi
 
 # Сертификат для srv
 cat > /root/ca/srv-san.cnf <<'EOF'
@@ -190,10 +201,12 @@ DNS.2 = web.lab.local
 DNS.3 = docker.lab.local
 IP.1 = 172.16.0.20
 EOF
-openssl req -new -nodes -out /root/ca/csr/srv.lab.local.csr -newkey rsa:2048 -keyout /root/ca/private/srv.lab.local.key -config /root/ca/srv-san.cnf
-openssl x509 -req -in /root/ca/csr/srv.lab.local.csr -CA /root/ca/certs/lab-root-ca.crt -CAkey /root/ca/private/lab-root-ca.key -CAcreateserial -out /root/ca/certs/srv.lab.local.crt -days 365 -sha256 -extensions req_ext -extfile /root/ca/srv-san.cnf
+if [ ! -f /root/ca/certs/srv.lab.local.crt ]; then
+    openssl req -new -nodes -out /root/ca/csr/srv.lab.local.csr -newkey rsa:2048 -keyout /root/ca/private/srv.lab.local.key -config /root/ca/srv-san.cnf
+    openssl x509 -req -in /root/ca/csr/srv.lab.local.csr -CA /root/ca/certs/lab-root-ca.crt -CAkey /root/ca/private/lab-root-ca.key -CAcreateserial -out /root/ca/certs/srv.lab.local.crt -days 365 -sha256 -extensions req_ext -extfile /root/ca/srv-san.cnf
+fi
 
-# HTTPS moodle на dc
+# Настройка HTTPS для moodle на dc
 mkdir -p /var/www/moodle
 echo "moodle.lab.local HTTPS OK" > /var/www/moodle/index.html
 mkdir -p /etc/pki/tls/certs /etc/pki/tls/private
@@ -216,16 +229,24 @@ cat > /etc/httpd2/conf/sites-available/moodle-https.conf <<'EOF'
     </Directory>
 </VirtualHost>
 EOF
-ln -sf /etc/httpd2/conf/sites-available/moodle-https.conf /etc/httpd2/conf/sites-enabled/
+safe ln -sf /etc/httpd2/conf/sites-available/moodle-https.conf /etc/httpd2/conf/sites-enabled/
 grep -q 'Listen 443' /etc/httpd2/conf/httpd2.conf || echo "Listen 443" >> /etc/httpd2/conf/httpd2.conf
 systemctl enable --now httpd2 || systemctl enable --now apache2
-systemctl restart httpd2 || systemctl restart apache2
+safe systemctl restart httpd2 || safe systemctl restart apache2
 
-# Копирование сертификатов на srv (ждём, пока srv поднимется, но если нет — пропускаем)
+# Установка Python setuptools для Ansible
+apt-get install -y python3 python3-module-setuptools
+[ -f /usr/bin/python ] || ln -sf /usr/bin/python3 /usr/bin/python
+
+# Права на сертификаты для копирования пользователем admin
+chmod 755 /root/ca/certs
+chmod 644 /root/ca/certs/lab-root-ca.crt
+
+# Копирование сертификатов на srv (если доступен)
 if ping -c1 -W2 172.16.0.20 >/dev/null 2>&1; then
-    sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 /root/ca/certs/srv.lab.local.crt admin@172.16.0.20:/tmp/ 2>/dev/null || true
-    sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 /root/ca/private/srv.lab.local.key admin@172.16.0.20:/tmp/ 2>/dev/null || true
-    sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 /root/ca/certs/lab-root-ca.crt admin@172.16.0.20:/tmp/ 2>/dev/null || true
+    safe sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 /root/ca/certs/srv.lab.local.crt admin@172.16.0.20:/tmp/
+    safe sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 /root/ca/private/srv.lab.local.key admin@172.16.0.20:/tmp/
+    safe sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 /root/ca/certs/lab-root-ca.crt admin@172.16.0.20:/tmp/
 else
     echo "srv not reachable, copy certificates manually later"
 fi
