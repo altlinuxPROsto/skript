@@ -4,6 +4,9 @@
 DC_MAC="aa:bb:cc:dd:ee:10"
 SRV_MAC="aa:bb:cc:dd:ee:20"
 # ------------------------------------
+set -e
+# Функция для безопасного выполнения команд
+safe() { "$@" || true; }
 
 hostnamectl set-hostname isp.lab.local
 WAN_IF=ens18
@@ -36,8 +39,7 @@ cat > /etc/hosts <<EOF
 EOF
 
 systemctl restart network
-ip -br a
-ping -c 3 8.8.8.8
+safe ping -c 3 8.8.8.8
 
 sed -i 's/^#\?net.ipv4.ip_forward.*/net.ipv4.ip_forward = 1/' /etc/net/sysctl.conf
 grep -q '^net.ipv4.ip_forward' /etc/net/sysctl.conf || echo 'net.ipv4.ip_forward = 1' >> /etc/net/sysctl.conf
@@ -45,14 +47,13 @@ sysctl -p /etc/net/sysctl.conf
 
 apt-get update
 
-# --- Установка Python 3 для Ansible (с запасными вариантами) ---
+# Установка Python 3 для Ansible с запасными вариантами
 if ! command -v python3 >/dev/null 2>&1; then
     apt-get install -y python3
 fi
 apt-get install -y python3-module-setuptools 2>/dev/null || apt-get install -y python3-setuptools 2>/dev/null || true
-[ -f /usr/bin/python ] || ln -s /usr/bin/python3 /usr/bin/python
+[ -f /usr/bin/python ] || ln -sf /usr/bin/python3 /usr/bin/python
 python3 --version || echo "Python3 installed but setuptools may be missing"
-# -------------------------------------------------------------
 
 apt-get install -y iptables
 
@@ -61,14 +62,12 @@ iptables -t nat -F
 iptables -P INPUT ACCEPT
 iptables -P OUTPUT ACCEPT
 iptables -P FORWARD ACCEPT
-
 iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o "$WAN_IF" -j MASQUERADE
 iptables -A FORWARD -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT
 iptables -A FORWARD -i "$WAN_IF" -o "$LAN_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
 iptables-save > /etc/sysconfig/iptables
 systemctl enable --now iptables
-systemctl restart iptables
+safe systemctl restart iptables
 
 apt-get install -y dhcp-server
 cat > /etc/dhcp/dhcpd.conf <<EOF
@@ -97,11 +96,10 @@ subnet 172.16.0.0 netmask 255.255.255.0 {
   }
 }
 EOF
-
-dhcpd -t -4 -cf /etc/dhcp/dhcpd.conf
+safe dhcpd -t -4 -cf /etc/dhcp/dhcpd.conf
 echo "DHCPDARGS=\"$LAN_IF\"" > /etc/sysconfig/dhcpd
 systemctl enable --now dhcpd
-systemctl restart dhcpd
+safe systemctl restart dhcpd
 
 apt-get install -y chrony
 cat > /etc/chrony.conf <<'EOF'
@@ -113,22 +111,21 @@ rtcsync
 logdir /var/log/chrony
 EOF
 systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony
-systemctl restart chronyd 2>/dev/null || systemctl restart chrony
+safe systemctl restart chronyd 2>/dev/null || safe systemctl restart chrony
 
 # Пользователи, sudo, SSH
 apt-get install -y sudo openssh-server htop procps
 for u in admin monitor; do
-  id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u"
-  echo "$u:P@ssw0rd" | chpasswd
+    id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u"
+    echo "$u:P@ssw0rd" | chpasswd
 done
-
 cat > /etc/sudoers.d/lab-users <<'EOF'
 admin ALL=(ALL) NOPASSWD: ALL
 Cmnd_Alias MONITORING = /usr/bin/htop, /bin/htop, /usr/bin/df, /bin/df, /usr/bin/free, /bin/free, /usr/bin/journalctl, /bin/journalctl, /usr/bin/systemctl status *, /bin/systemctl status *
 monitor ALL=(root) NOPASSWD: MONITORING
 EOF
 chmod 0440 /etc/sudoers.d/lab-users
-visudo -c
+safe visudo -c
 
 echo "Authorized access only" > /etc/issue.net
 SSHD_CONFIG=/etc/openssh/sshd_config
@@ -143,9 +140,9 @@ MaxAuthTries 2
 PermitRootLogin no
 AllowUsers admin monitor
 EOF
-sshd -t -f "$SSHD_CONFIG"
+safe sshd -t -f "$SSHD_CONFIG"
 systemctl enable --now sshd
-systemctl restart sshd
+safe systemctl restart sshd
 
 # Расширенный firewall
 iptables -F
@@ -169,6 +166,6 @@ iptables -A FORWARD -i "$LAN_IF" -o "$WAN_IF" -s 172.16.0.0/24 -p udp --dport 12
 iptables -A FORWARD -i "$LAN_IF" -o "$WAN_IF" -s 172.16.0.0/24 -p icmp -j ACCEPT
 iptables -A FORWARD -i "$WAN_IF" -o "$LAN_IF" -d 172.16.0.0/24 -j DROP
 iptables-save > /etc/sysconfig/iptables
-systemctl restart iptables
+safe systemctl restart iptables
 
 echo "=== isp done ==="
