@@ -1,5 +1,7 @@
 #!/bin/bash
 # ========== srv.lab.local ==========
+set -e
+safe() { "$@" || true; }
 
 hostnamectl set-hostname srv.lab.local
 IFACE=ens18
@@ -12,37 +14,31 @@ ONBOOT=yes
 NM_CONTROLLED=no
 DISABLED=no
 EOF
-
 cat > /etc/net/ifaces/$IFACE/resolv.conf <<EOF
 search lab.local
 nameserver 8.8.8.8
 EOF
-
 cat > /etc/hosts <<EOF
 127.0.0.1 localhost
 172.16.0.1 isp.lab.local isp
 172.16.0.10 dc.lab.local dc
 172.16.0.20 srv.lab.local srv
 EOF
-
 systemctl restart network
-ip -br a
-
 apt-get update
+
+# Пользователи и SSH
 apt-get install -y sudo openssh-server htop procps sshpass
-
 for u in admin monitor; do
-  id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u"
-  echo "$u:P@ssw0rd" | chpasswd
+    id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u"
+    echo "$u:P@ssw0rd" | chpasswd
 done
-
 cat > /etc/sudoers.d/lab-users <<'EOF'
 admin ALL=(ALL) NOPASSWD: ALL
 Cmnd_Alias MONITORING = /usr/bin/htop, /bin/htop, /usr/bin/df, /bin/df, /usr/bin/free, /bin/free, /usr/bin/journalctl, /bin/journalctl, /usr/bin/systemctl status *, /bin/systemctl status *
 monitor ALL=(root) NOPASSWD: MONITORING
 EOF
 chmod 0440 /etc/sudoers.d/lab-users
-
 echo "Authorized access only" > /etc/issue.net
 SSHD_CONFIG=/etc/openssh/sshd_config
 [ -f /etc/ssh/sshd_config ] && SSHD_CONFIG=/etc/ssh/sshd_config
@@ -55,10 +51,11 @@ MaxAuthTries 2
 PermitRootLogin no
 AllowUsers admin monitor
 EOF
-sshd -t -f "$SSHD_CONFIG"
+safe sshd -t -f "$SSHD_CONFIG"
 systemctl enable --now sshd
-systemctl restart sshd
+safe systemctl restart sshd
 
+# NTP
 apt-get install -y chrony
 cat > /etc/chrony.conf <<'EOF'
 server 172.16.0.1 iburst
@@ -67,24 +64,25 @@ rtcsync
 logdir /var/log/chrony
 EOF
 systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony
-systemctl restart chronyd 2>/dev/null || systemctl restart chrony
+safe systemctl restart chronyd 2>/dev/null || safe systemctl restart chrony
 
+# Docker
 apt-get install -y docker-engine docker-compose
 systemctl enable --now docker
 
+# Подключение ISO (если есть)
 mkdir -p /mnt/additional
-mount /dev/sr0 /mnt/additional 2>/dev/null || mount /dev/cdrom /mnt/additional 2>/dev/null || true
+safe mount /dev/sr0 /mnt/additional 2>/dev/null
+safe mount /dev/cdrom /mnt/additional 2>/dev/null
 if [ -d /mnt/additional/docker ]; then
-  for img in /mnt/additional/docker/*.tar; do
-    [ -f "$img" ] && docker load -i "$img"
-  done
+    for img in /mnt/additional/docker/*.tar; do
+        [ -f "$img" ] && safe docker load -i "$img"
+    done
 fi
-if ! docker image inspect mariadb_latest >/dev/null 2>&1; then
-  docker pull mariadb:latest && docker tag mariadb:latest mariadb_latest
-fi
-if ! docker image inspect site_latest >/dev/null 2>&1; then
-  docker pull nginx:latest && docker tag nginx:latest site_latest
-fi
+# Заглушка, если образов нет
+safe docker pull mariadb:latest && safe docker tag mariadb:latest mariadb_latest
+safe docker pull nginx:latest && safe docker tag nginx:latest site_latest
+
 mkdir -p /opt/testapp
 cd /opt/testapp
 cat > docker-compose.yml <<'EOF'
@@ -118,36 +116,38 @@ services:
 volumes:
   dbdata:
 EOF
-docker compose up -d 2>/dev/null || docker-compose up -d
+safe docker compose up -d 2>/dev/null || safe docker-compose up -d
 
-# --- Удаление конфликтующего пакета (если есть) ---
-apt-get remove -y alterator-datetime 2>/dev/null || true
-# ------------------------------------------------
+# Удаление конфликтующего пакета alterator-datetime (если есть)
+safe apt-get remove -y alterator-datetime
 
+# Apache, MariaDB, PHP
 apt-get install -y apache2 mariadb-server php8.4 php8.4-mysqlnd apache2-mod_ssl
 systemctl enable --now mariadb || systemctl enable --now mysqld
-systemctl restart mariadb || systemctl restart mysqld
+safe systemctl restart mariadb || safe systemctl restart mysqld
 systemctl enable --now httpd2 || systemctl enable --now apache2
-systemctl restart httpd2 || systemctl restart apache2
+safe systemctl restart httpd2 || safe systemctl restart apache2
 
-mysql <<'SQL'
+# База данных webdb
+mariadb <<'SQL'
 CREATE DATABASE IF NOT EXISTS webdb CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS 'web'@'localhost' IDENTIFIED BY 'P@ssw0rd';
 GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'localhost';
 FLUSH PRIVILEGES;
 SQL
 if [ -f /mnt/additional/web/dump.sql ]; then
-  mariadb webdb < /mnt/additional/web/dump.sql
+    mariadb webdb < /mnt/additional/web/dump.sql
 fi
 
+# Копирование файлов сайта
 DOCROOT=/var/www/html
 [ -d /var/www/default/html ] && DOCROOT=/var/www/default/html
 mkdir -p "$DOCROOT"
 if [ -f /mnt/additional/web/index.php ]; then
-  cp -av /mnt/additional/web/index.php "$DOCROOT"/
+    cp -av /mnt/additional/web/index.php "$DOCROOT"/
 fi
 if [ -d /mnt/additional/web/images ]; then
-  cp -av /mnt/additional/web/images "$DOCROOT"/ 2>/dev/null || true
+    cp -av /mnt/additional/web/images "$DOCROOT"/ 2>/dev/null || true
 fi
 chown -R apache2:apache2 "$DOCROOT" 2>/dev/null || chown -R apache:apache "$DOCROOT" 2>/dev/null || true
 find "$DOCROOT" -type d -exec chmod 755 {} \;
@@ -155,36 +155,32 @@ find "$DOCROOT" -type f -exec chmod 644 {} \;
 sed -i 's/$username = "user";/$username = "web";/' "$DOCROOT/index.php" 2>/dev/null
 sed -i 's/$password = "password";/$password = "P@ssw0rd";/' "$DOCROOT/index.php" 2>/dev/null
 sed -i 's/$dbname = "db";/$dbname = "webdb";/' "$DOCROOT/index.php" 2>/dev/null
-systemctl restart httpd2 || systemctl restart apache2
+safe systemctl restart httpd2 || safe systemctl restart apache2
 
 # RAID5 (vdb,vdc,vdd)
 if [ -b /dev/vdb ] && [ -b /dev/vdc ] && [ -b /dev/vdd ]; then
-  apt-get install -y mdadm e2fsprogs
-  mdadm --create /dev/md0 --level=5 --raid-devices=3 /dev/vdb /dev/vdc /dev/vdd --run
-  mkfs.ext4 -L RAID5 /dev/md0
-  mkdir -p /srv/storage
-  UUID=$(blkid -s UUID -o value /dev/md0)
-  grep -q '/srv/storage' /etc/fstab || echo "UUID=$UUID /srv/storage ext4 defaults 0 2" >> /etc/fstab
-  mount -a
-  mdadm --detail --scan > /etc/mdadm.conf
-  mkdir -p /srv/storage/instructions /srv/storage/share /srv/storage/secret
-  chmod 0775 /srv/storage/instructions
-  chmod 0777 /srv/storage/share
-  chmod 0770 /srv/storage/secret
-  echo "Readme instructions" > /srv/storage/instructions/readme.txt
-  echo "Public share" > /srv/storage/share/readme.txt
-  echo "Secret admins only" > /srv/storage/secret/readme.txt
+    apt-get install -y mdadm e2fsprogs
+    if [ ! -b /dev/md0 ]; then
+        mdadm --create /dev/md0 --level=5 --raid-devices=3 /dev/vdb /dev/vdc /dev/vdd --run
+    fi
+    mkfs.ext4 -F /dev/md0 2>/dev/null || true
+    mkdir -p /srv/storage
+    UUID=$(blkid -s UUID -o value /dev/md0)
+    grep -q '/srv/storage' /etc/fstab || echo "UUID=$UUID /srv/storage ext4 defaults 0 2" >> /etc/fstab
+    mount -a
+    mdadm --detail --scan > /etc/mdadm.conf
 else
-  mkdir -p /srv/storage/instructions /srv/storage/share /srv/storage/secret
-  chmod 0775 /srv/storage/instructions
-  chmod 0777 /srv/storage/share
-  chmod 0770 /srv/storage/secret
-  echo "Readme instructions" > /srv/storage/instructions/readme.txt
-  echo "Public share" > /srv/storage/share/readme.txt
-  echo "Secret admins only" > /srv/storage/secret/readme.txt
+    mkdir -p /srv/storage
 fi
+mkdir -p /srv/storage/{instructions,share,secret}
+chmod 0775 /srv/storage/instructions
+chmod 0777 /srv/storage/share
+chmod 0770 /srv/storage/secret
+echo "Readme instructions" > /srv/storage/instructions/readme.txt
+echo "Public share" > /srv/storage/share/readme.txt
+echo "Secret admins only" > /srv/storage/secret/readme.txt
 
-# Ввод srv в домен (Samba шары)
+# Ввод srv в домен (Samba)
 apt-get install -y samba samba-client krb5-workstation samba-winbind bind-utils
 cat > /etc/net/ifaces/$IFACE/resolv.conf <<EOF
 search lab.local
@@ -239,22 +235,29 @@ cat > /etc/samba/smb.conf <<'EOF'
    create mask = 0660
    directory mask = 0770
 EOF
-net ads join -U Administrator%P@ssw0rd || true
-systemctl enable --now winbind
-systemctl enable --now smb nmb || systemctl enable --now samba
-systemctl restart winbind
-systemctl restart smb nmb || systemctl restart samba
 
-# HTTPS (если сертификаты уже скопированы с dc)
+# Присоединение к домену с полным обновлением ключей
+safe net ads leave -U Administrator%P@ssw0rd
+rm -f /etc/krb5.keytab /var/lib/samba/private/secrets.tdb /var/lib/samba/private/schannels_store.tdb
+net ads join -U Administrator%P@ssw0rd
+# Добавляем principal cifs в keytab (необходимо для монтирования)
+net ads keytab add cifs -U Administrator%P@ssw0rd
+systemctl enable --now winbind smb nmb
+safe systemctl restart winbind smb nmb
+
+# Установка Python setuptools для Ansible
+apt-get install -y python3 python3-module-setuptools
+[ -f /usr/bin/python ] || ln -sf /usr/bin/python3 /usr/bin/python
+
+# Настройка HTTPS (если сертификаты уже скопированы с dc)
 if [ -f /tmp/srv.lab.local.crt ] && [ -f /tmp/srv.lab.local.key ]; then
-  mkdir -p /etc/pki/tls/certs /etc/pki/tls/private
-  mv /tmp/srv.lab.local.crt /etc/pki/tls/certs/
-  mv /tmp/srv.lab.local.key /etc/pki/tls/private/
-  mv /tmp/lab-root-ca.crt /etc/pki/tls/certs/
-  chmod 600 /etc/pki/tls/private/srv.lab.local.key
-  a2enmod ssl proxy proxy_http 2>/dev/null || true
-  systemctl restart httpd2
-  cat > /etc/httpd2/conf/sites-available/lab-https.conf <<'EOF'
+    mkdir -p /etc/pki/tls/certs /etc/pki/tls/private
+    mv /tmp/srv.lab.local.crt /etc/pki/tls/certs/
+    mv /tmp/srv.lab.local.key /etc/pki/tls/private/
+    mv /tmp/lab-root-ca.crt /etc/pki/tls/certs/
+    chmod 600 /etc/pki/tls/private/srv.lab.local.key
+    a2enmod ssl proxy proxy_http 2>/dev/null || true
+    cat > /etc/httpd2/conf/sites-available/lab-https.conf <<'EOF'
 <VirtualHost *:80>
     ServerName web.lab.local
     Redirect 301 / https://web.lab.local/
@@ -283,11 +286,11 @@ if [ -f /tmp/srv.lab.local.crt ] && [ -f /tmp/srv.lab.local.key ]; then
     ProxyPassReverse / http://127.0.0.1:8080/
 </VirtualHost>
 EOF
-  ln -sf /etc/httpd2/conf/sites-available/lab-https.conf /etc/httpd2/conf/sites-enabled/
-  grep -q 'Listen 443' /etc/httpd2/conf/httpd2.conf || echo "Listen 443" >> /etc/httpd2/conf/httpd2.conf
-  systemctl restart httpd2
+    ln -sf /etc/httpd2/conf/sites-available/lab-https.conf /etc/httpd2/conf/sites-enabled/
+    grep -q 'Listen 443' /etc/httpd2/conf/httpd2.conf || echo "Listen 443" >> /etc/httpd2/conf/httpd2.conf
+    systemctl restart httpd2
 else
-  echo "SSL certificates not found in /tmp/, HTTPS not configured"
+    echo "SSL certificates not found in /tmp/, HTTPS not configured"
 fi
 
 echo "=== srv done ==="
