@@ -95,7 +95,11 @@ EOF
 systemctl restart network
 
 realm discover lab.local
-echo "P@ssw0rd" | realm join -U Administrator lab.local
+if ! realm list | grep -q "configured:.*kerberos-member"; then
+    echo "P@ssw0rd" | realm join -U Administrator lab.local
+else
+    echo "Already joined to domain, skipping realm join"
+fi
 
 grep -q '^passwd:.*sss' /etc/nsswitch.conf || sed -i '/^passwd:/ s/$/ sss/' /etc/nsswitch.conf
 grep -q '^group:.*sss' /etc/nsswitch.conf || sed -i '/^group:/ s/$/ sss/' /etc/nsswitch.conf
