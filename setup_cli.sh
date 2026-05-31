@@ -5,7 +5,7 @@ set -e
 hostnamectl set-hostname cli.lab.local
 IFACE=ens18
 mkdir -p /etc/net/ifaces/$IFACE
-
+cat /etc/net/ifaces/ens18/options
 cat > /etc/net/ifaces/$IFACE/options <<EOF
 TYPE=eth
 BOOTPROTO=dhcp
@@ -95,7 +95,6 @@ EOF
 systemctl restart network
 
 realm discover lab.local
-# Исправлено: убран --password, пароль через stdin
 echo "P@ssw0rd" | realm join -U Administrator lab.local
 
 grep -q '^passwd:.*sss' /etc/nsswitch.conf || sed -i '/^passwd:/ s/$/ sss/' /etc/nsswitch.conf
