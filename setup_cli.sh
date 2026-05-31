@@ -95,7 +95,8 @@ EOF
 systemctl restart network
 
 realm discover lab.local
-echo "P@ssw0rd" | realm join --password='P@ssw0rd' -U Administrator lab.local
+# Исправлено: убран --password, пароль через stdin
+echo "P@ssw0rd" | realm join -U Administrator lab.local
 
 grep -q '^passwd:.*sss' /etc/nsswitch.conf || sed -i '/^passwd:/ s/$/ sss/' /etc/nsswitch.conf
 grep -q '^group:.*sss' /etc/nsswitch.conf || sed -i '/^group:/ s/$/ sss/' /etc/nsswitch.conf
