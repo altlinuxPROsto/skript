@@ -4,7 +4,6 @@
 DC_MAC="aa:bb:cc:dd:ee:10"
 SRV_MAC="aa:bb:cc:dd:ee:20"
 # ------------------------------------
-set -e  # остановка при ошибке (можно убрать)
 
 hostnamectl set-hostname isp.lab.local
 WAN_IF=ens18
@@ -45,6 +44,16 @@ grep -q '^net.ipv4.ip_forward' /etc/net/sysctl.conf || echo 'net.ipv4.ip_forward
 sysctl -p /etc/net/sysctl.conf
 
 apt-get update
+
+# --- Установка Python 3 для Ansible (с запасными вариантами) ---
+if ! command -v python3 >/dev/null 2>&1; then
+    apt-get install -y python3
+fi
+apt-get install -y python3-module-setuptools 2>/dev/null || apt-get install -y python3-setuptools 2>/dev/null || true
+[ -f /usr/bin/python ] || ln -s /usr/bin/python3 /usr/bin/python
+python3 --version || echo "Python3 installed but setuptools may be missing"
+# -------------------------------------------------------------
+
 apt-get install -y iptables
 
 iptables -F
