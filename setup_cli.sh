@@ -1,12 +1,10 @@
 #!/bin/bash
-# ========== cli.lab.local ==========
 set -e
-safe() { "$@" || true; }
 
+# Hostname и сеть (DHCP)
 hostnamectl set-hostname cli.lab.local
 IFACE=ens18
 mkdir -p /etc/net/ifaces/$IFACE
-
 cat > /etc/net/ifaces/$IFACE/options <<EOF
 TYPE=eth
 BOOTPROTO=dhcp
@@ -14,21 +12,18 @@ ONBOOT=yes
 NM_CONTROLLED=no
 DISABLED=no
 EOF
+# DNS-клиент сначала временно, потом через DHCP
 cat > /etc/net/ifaces/$IFACE/resolv.conf <<EOF
 search lab.local
 nameserver 8.8.8.8
 EOF
-cat > /etc/hosts <<EOF
-127.0.0.1 localhost
-172.16.0.1 isp.lab.local isp
-172.16.0.10 dc.lab.local dc
-172.16.0.20 srv.lab.local srv
-EOF
 systemctl restart network
-
 apt-get update
-apt-get install -y sudo openssh-server htop procps ansible openssh-clients bind-utils samba-client cifs-utils task-auth-ad-sssd krb5-workstation sshpass
 
+# Установка пакетов
+apt-get install -y sudo openssh-server htop procps ansible openssh-clients bind-utils samba-client cifs-utils task-auth-ad-sssd krb5-workstation sshpass chrony
+
+# Локальные пользователи и sudo
 for u in admin monitor; do
     id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u"
     echo "$u:P@ssw0rd" | chpasswd
@@ -39,115 +34,64 @@ Cmnd_Alias MONITORING = /usr/bin/htop, /bin/htop, /usr/bin/df, /bin/df, /usr/bin
 monitor ALL=(root) NOPASSWD: MONITORING
 EOF
 chmod 0440 /etc/sudoers.d/lab-users
+
+# SSH (порт 2222)
 echo "Authorized access only" > /etc/issue.net
 SSHD_CONFIG=/etc/openssh/sshd_config
 [ -f /etc/ssh/sshd_config ] && SSHD_CONFIG=/etc/ssh/sshd_config
-sed -i -E '/^[[:space:]]*#?[[:space:]]*(Port|Banner|MaxAuthTries|PermitRootLogin|AllowUsers)[[:space:]]/d' "$SSHD_CONFIG"
-cat >> "$SSHD_CONFIG" <<'EOF'
+if ! grep -q "^Port 2222" "$SSHD_CONFIG"; then
+    sed -i '/^Port/d' "$SSHD_CONFIG"
+    echo "Port 2222" >> "$SSHD_CONFIG"
+    echo "Banner /etc/issue.net" >> "$SSHD_CONFIG"
+    echo "MaxAuthTries 2" >> "$SSHD_CONFIG"
+    echo "PermitRootLogin no" >> "$SSHD_CONFIG"
+    echo "AllowUsers admin monitor" >> "$SSHD_CONFIG"
+    systemctl restart sshd
+fi
 
-Port 2222
-Banner /etc/issue.net
-MaxAuthTries 2
-PermitRootLogin no
-AllowUsers admin monitor
-EOF
-safe sshd -t -f "$SSHD_CONFIG"
-systemctl enable --now sshd
-safe systemctl restart sshd
-
-apt-get install -y chrony
-cat > /etc/chrony.conf <<'EOF'
+# NTP-клиент
+cat > /etc/chrony.conf <<EOF
 server 172.16.0.1 iburst
 makestep 1.0 3
 rtcsync
 logdir /var/log/chrony
 EOF
-systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony
-safe systemctl restart chronyd 2>/dev/null || safe systemctl restart chrony
+systemctl enable --now chronyd
 
-mkdir -p /etc/ansible
-cat > /etc/ansible/inventory.ini <<'EOF'
-[servers]
-isp ansible_host=172.16.0.1 ansible_port=2222
-dc  ansible_host=172.16.0.10 ansible_port=2222
-srv ansible_host=172.16.0.20 ansible_port=2222
+# Ввод в домен (только если не введены)
+if ! realm list | grep -q "lab.local"; then
+    echo "P@ssw0rd" | realm join -U Administrator lab.local
+fi
 
-[servers:vars]
-ansible_user=admin
-ansible_become=true
-ansible_become_method=sudo
-ansible_python_interpreter=/usr/bin/python3
-ansible_ssh_private_key_file=/home/admin/.ssh/id_ed25519
-EOF
-chown -R admin:admin /etc/ansible
-
+# Настройка DNS на DC
 cat > /etc/net/ifaces/$IFACE/resolv.conf <<EOF
 search lab.local
 nameserver 172.16.0.10
 EOF
 systemctl restart network
 
-# Присоединение к домену (если уже присоединены – пропустить)
-if ! realm list | grep -q "configured:.*kerberos-member"; then
-    echo "P@ssw0rd" | safe realm join -U Administrator lab.local
-else
-    echo "Already joined to domain, skipping realm join"
-fi
+# Ansible инвентарь (создаём, если нет)
+INVENTORY="/etc/ansible/inventory.ini"
+if [ ! -f "$INVENTORY" ]; then
+    mkdir -p /etc/ansible
+    cat > "$INVENTORY" <<EOF
+[servers]
+dc ansible_host=172.16.0.10 ansible_user=admin ansible_ssh_port=2222
+srv ansible_host=172.16.0.20 ansible_user=admin ansible_ssh_port=2222
+isp ansible_host=172.16.0.1 ansible_user=admin ansible_ssh_port=2222
 
-# Добавляем sss в nsswitch, если отсутствует
-for entry in passwd group shadow; do
-    if ! grep -q "^$entry:.*sss" /etc/nsswitch.conf; then
-        sed -i "/^$entry:/ s/$/ sss/" /etc/nsswitch.conf
-    fi
-done
-systemctl restart sssd
-safe sss_cache -E
-
-# Проверка
-safe realm list
-echo "P@ssw0rd" | safe kinit Administrator@LAB.LOCAL
-safe klist
-safe id ivanov@lab.local
-
-# SMB-монтирование (если пользователь уже виден)
-if id ivanov@lab.local >/dev/null 2>&1; then
-    mkdir -p /mnt/instructions /mnt/share /mnt/secret
-    cat > /root/.smb-ivanov <<'EOF'
-username=ivanov
-password=P@ssw0rd
-domain=LAB
+[all:vars]
+ansible_ssh_common_args='-o StrictHostKeyChecking=no'
 EOF
-    chmod 600 /root/.smb-ivanov
-    safe mount -t cifs //srv.lab.local/instructions /mnt/instructions -o credentials=/root/.smb-ivanov,vers=3.0
-    safe mount -t cifs //srv.lab.local/share /mnt/share -o credentials=/root/.smb-ivanov,vers=3.0
-    safe mount -t cifs //srv.lab.local/secret /mnt/secret -o credentials=/root/.smb-ivanov,vers=3.0
-else
-    echo "User ivanov not yet synchronized, skip mounting"
 fi
 
-# Корневой сертификат
-safe sshpass -p 'P@ssw0rd' scp -o StrictHostKeyChecking=no -P 2222 admin@172.16.0.10:/root/ca/certs/lab-root-ca.crt /tmp/
-if [ -f /tmp/lab-root-ca.crt ]; then
-    if [ -d /etc/pki/ca-trust/source/anchors ]; then
-        cp /tmp/lab-root-ca.crt /etc/pki/ca-trust/source/anchors/
-        update-ca-trust
-    elif [ -d /usr/local/share/ca-certificates ]; then
-        cp /tmp/lab-root-ca.crt /usr/local/share/ca-certificates/
-        update-ca-certificates
-    else
-        mkdir -p /etc/ssl/certs
-        cp /tmp/lab-root-ca.crt /etc/ssl/certs/
-    fi
-    safe openssl verify -CAfile /tmp/lab-root-ca.crt /tmp/lab-root-ca.crt
-else
-    echo "Certificate not copied, skip"
-fi
-
-# SSH-ключи для admin (без интерактива)
+# SSH-ключи для admin (генерируем, если нет)
 su - admin <<'ADMIN_SCRIPT'
-ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q <<< y >/dev/null 2>&1
+if [ ! -f ~/.ssh/id_ed25519 ]; then
+    ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q <<< y >/dev/null 2>&1
+fi
 for ip in 172.16.0.1 172.16.0.10 172.16.0.20; do
-    sshpass -p 'P@ssw0rd' ssh-copy-id -o StrictHostKeyChecking=no -p 2222 admin@$ip 2>/dev/null || true
+    ssh-copy-id -o StrictHostKeyChecking=no -p 2222 admin@$ip 2>/dev/null || true
 done
 cat > ~/.ssh/config <<EOF
 Host isp
@@ -167,13 +111,11 @@ Host srv
   IdentityFile ~/.ssh/id_ed25519
 EOF
 chmod 600 ~/.ssh/config
-ssh isp hostname -f
-ssh dc hostname -f
-ssh srv hostname -f
 ADMIN_SCRIPT
 
-# Ansible плейбук
-cat > /etc/ansible/install_htop.yml <<'EOF'
+# Ansible плейбук для установки htop (если ещё не запускали)
+if ! ansible all -m ping -i "$INVENTORY" 2>/dev/null | grep -q "pong"; then
+    cat > /etc/ansible/install_htop.yml <<'EOF'
 ---
 - name: Install htop on all servers
   hosts: servers
@@ -183,7 +125,34 @@ cat > /etc/ansible/install_htop.yml <<'EOF'
       command: apt-get install -y htop
       changed_when: false
 EOF
-safe ansible all -i /etc/ansible/inventory.ini -m ping
-safe ansible-playbook -i /etc/ansible/inventory.ini /etc/ansible/install_htop.yml
+    ansible-playbook -i "$INVENTORY" /etc/ansible/install_htop.yml
+fi
 
-echo "=== cli done ==="
+# Монтирование CIFS-шар (если не смонтированы)
+# Получаем UID/GID для ivanov через winbind
+if getent passwd ivanov >/dev/null 2>&1; then
+    IVANOV_UID=$(id -u ivanov)
+    IVANOV_GID=$(id -g ivanov)
+    ADMINS_GID=$(getent group "admins" | cut -d: -f3)
+else
+    IVANOV_UID=11105
+    IVANOV_GID=10513
+    ADMINS_GID=11103
+fi
+mkdir -p /mnt/instructions /mnt/share /mnt/secret
+mount -t cifs //172.16.0.20/instructions /mnt/instructions -o username=ivanov,password=P@ssw0rd,domain=LAB.LOCAL,vers=3.0,uid=$IVANOV_UID,gid=$IVANOV_GID 2>/dev/null || true
+mount -t cifs //172.16.0.20/share /mnt/share -o username=ivanov,password=P@ssw0rd,domain=LAB.LOCAL,vers=3.0,uid=$IVANOV_UID,gid=$IVANOV_GID 2>/dev/null || true
+mount -t cifs //172.16.0.20/secret /mnt/secret -o username=ivanov,password=P@ssw0rd,domain=LAB.LOCAL,vers=3.0,uid=$IVANOV_UID,gid=$ADMINS_GID 2>/dev/null || true
+
+# Корневой сертификат (если доступен)
+if scp -P 2222 admin@172.16.0.10:/root/ca/certs/lab-root-ca.crt /tmp/ 2>/dev/null; then
+    if [ -d /etc/pki/ca-trust/source/anchors ]; then
+        cp /tmp/lab-root-ca.crt /etc/pki/ca-trust/source/anchors/
+        update-ca-trust
+    elif [ -d /usr/local/share/ca-certificates ]; then
+        cp /tmp/lab-root-ca.crt /usr/local/share/ca-certificates/
+        update-ca-certificates
+    fi
+fi
+
+echo "=== CLI setup finished ==="
